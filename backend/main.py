@@ -2,8 +2,10 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from dotenv import load_dotenv
-import easyocr
 import io
+import os
+import requests
+
 from services.url_analyzer import analyze_url
 from services.llm import analyze_claim
 from services.evidence import search_news
@@ -11,6 +13,8 @@ from services.verifier import verify_claim
 
 
 load_dotenv()
+
+OCR_API_KEY = os.getenv("OCR_API_KEY")
 
 app = FastAPI(
     title="VerifAI API",
@@ -26,7 +30,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-reader = easyocr.Reader(["en"], gpu=False)
+
+def extract_text_from_image(contents: bytes, filename: str) -> str:
+
+    if not OCR_API_KEY:
+        raise RuntimeError("OCR_API_KEY is not configured.")
+
+    response = requests.post(
+        "https://api.ocr.space/parse/image",
+        files={
+            "file": (
+                filename or "image.jpg",
+                contents
+            )
+        },
+        data={
+            "apikey": OCR_API_KEY,
+            "language": "eng",
+            "isOverlayRequired": "false",
+            "OCREngine": "2",
+            "scale": "true",
+        },
+        timeout=60,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if data.get("IsErroredOnProcessing"):
+        errors = data.get("ErrorMessage", "OCR processing failed.")
+
+        if isinstance(errors, list):
+            errors = " ".join(str(error) for error in errors)
+
+        raise RuntimeError(str(errors))
+
+    parsed_results = data.get("ParsedResults", [])
+
+    extracted_text = " ".join(
+        result.get("ParsedText", "")
+        for result in parsed_results
+        if isinstance(result, dict)
+    ).strip()
+
+    return extracted_text
 
 
 @app.get("/health")
@@ -49,7 +97,7 @@ async def verify(file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(
             status_code=400,
-            detail="For now, VerifAI accepts image files only."
+            detail="VerifAI accepts image files only."
         )
 
     contents = await file.read()
@@ -70,15 +118,10 @@ async def verify(file: UploadFile = File(...)):
         )
 
     try:
-        results = reader.readtext(
+        extracted_text = extract_text_from_image(
             contents,
-            detail=1
+            file.filename or "image.jpg"
         )
-
-        extracted_text = " ".join(
-            result[1]
-            for result in results
-        ).strip()
 
     except Exception as e:
         return {
@@ -88,13 +131,12 @@ async def verify(file: UploadFile = File(...)):
             "claim_analysis": None,
             "evidence": [],
             "verification": {
-                "verdict": "INSUFFICIENT_EVIDENCE",
-                "reasoning": "OCR processing failed.",
-                "claim_components": [],
-                "supporting_evidence": [],
-                "contradicting_evidence": [],
-                "insufficient_evidence": [],
-                "limitations": [str(e)]
+                "conclusion": "The image could not be processed for verification.",
+                "explanation": f"OCR processing failed: {str(e)}",
+                "evidence_analysis": [],
+                "limitations": [
+                    "The OCR service could not extract readable text."
+                ]
             },
             "status": "analysis_failed"
         }
@@ -107,12 +149,9 @@ async def verify(file: UploadFile = File(...)):
             "claim_analysis": None,
             "evidence": [],
             "verification": {
-                "verdict": "INSUFFICIENT_EVIDENCE",
-                "reasoning": "No readable factual text was detected in the image.",
-                "claim_components": [],
-                "supporting_evidence": [],
-                "contradicting_evidence": [],
-                "insufficient_evidence": [],
+                "conclusion": "The image does not contain enough readable text to verify a claim.",
+                "explanation": "No readable factual text was detected.",
+                "evidence_analysis": [],
                 "limitations": [
                     "The submitted image did not contain enough readable text for claim verification."
                 ]
@@ -131,12 +170,9 @@ async def verify(file: UploadFile = File(...)):
             "claim_analysis": None,
             "evidence": [],
             "verification": {
-                "verdict": "INSUFFICIENT_EVIDENCE",
-                "reasoning": "Claim analysis failed.",
-                "claim_components": [],
-                "supporting_evidence": [],
-                "contradicting_evidence": [],
-                "insufficient_evidence": [],
+                "conclusion": "The claim could not be analyzed.",
+                "explanation": f"Claim analysis failed: {str(e)}",
+                "evidence_analysis": [],
                 "limitations": [str(e)]
             },
             "status": "analysis_failed"
@@ -150,12 +186,9 @@ async def verify(file: UploadFile = File(...)):
             "claim_analysis": claim_analysis,
             "evidence": [],
             "verification": {
-                "verdict": "INSUFFICIENT_EVIDENCE",
-                "reasoning": "The claim could not be reliably extracted.",
-                "claim_components": [],
-                "supporting_evidence": [],
-                "contradicting_evidence": [],
-                "insufficient_evidence": [],
+                "conclusion": "A sufficiently clear factual claim could not be extracted.",
+                "explanation": "The claim extraction step did not produce a usable factual proposition.",
+                "evidence_analysis": [],
                 "limitations": [
                     "Claim extraction model failed."
                 ]
@@ -183,12 +216,9 @@ async def verify(file: UploadFile = File(...)):
 
     except Exception as e:
         verification = {
-            "verdict": "INSUFFICIENT_EVIDENCE",
-            "reasoning": "The verification engine failed.",
-            "claim_components": [],
-            "supporting_evidence": [],
-            "contradicting_evidence": [],
-            "insufficient_evidence": [],
+            "conclusion": "The claim could not be reliably verified.",
+            "explanation": f"The verification engine failed: {str(e)}",
+            "evidence_analysis": [],
             "limitations": [str(e)]
         }
 
@@ -201,6 +231,7 @@ async def verify(file: UploadFile = File(...)):
         "verification": verification,
         "status": "analysis_ready"
     }
+
 
 @app.post("/verify-url")
 async def verify_url(url: str):
